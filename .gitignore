@@ -1,0 +1,34 @@
+# Python 虚拟环境
+venv/
+env/
+ENV/
+.env/
+.venv/
+
+# Python 缓存文件
+__pycache__/
+*.py[cod]
+*.so
+.Python
+*.egg-info/
+*.egg
+
+# 日志文件
+*.log
+logs/
+
+# IDE 文件
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# 系统文件
+.DS_Store
+Thumbs.db
+
+# 私钥和配置文件
+*.pem
+*.key
+config.ini
+secrets.py 
