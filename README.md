@@ -352,3 +352,6 @@ cp config.example.ini config.ini
 1. 调整`max_direct_size`参数限制直接读取的文件大小
 2. 减少`max_workers`参数值，限制并发线程数量
 3. 确保服务器有足够的RAM和SWAP空间 
+
+## 效果展示
+![](https://upload.fffuk.com/cloudpic/ai/2025/04/70d1abe942c95190ab0862a677ba4da7.png)
