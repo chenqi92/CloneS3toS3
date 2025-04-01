@@ -102,7 +102,8 @@ class S3Migrator:
         chunk_size: int = 8 * 1024 * 1024,  # 8MB
         is_source_r2: bool = False,
         direct_read: bool = False,
-        max_direct_size: int = 500 * 1024 * 1024  # 默认500MB，超过此大小的文件使用分块上传
+        max_direct_size: int = 500 * 1024 * 1024,  # 默认500MB，超过此大小的文件使用分块上传
+        skip_existing: bool = True  # 默认跳过已存在的文件
     ):
         """
         初始化S3迁移器
@@ -120,6 +121,7 @@ class S3Migrator:
             is_source_r2: 源存储是否是Cloudflare R2
             direct_read: 是否直接读取所有文件，不使用分块处理
             max_direct_size: 直接读取的最大文件大小，超过此大小的文件使用分块上传
+            skip_existing: 是否跳过已存在的文件
         """
         self.source_endpoint = source_endpoint
         self.source_access_key = source_access_key
@@ -135,6 +137,7 @@ class S3Migrator:
         self.is_source_r2 = is_source_r2
         self.direct_read = direct_read
         self.max_direct_size = max_direct_size
+        self.skip_existing = skip_existing
         
         # 初始化源S3客户端
         self.source_client = boto3.client(
@@ -337,6 +340,45 @@ class S3Migrator:
         key = obj['Key']
         size = obj['Size']
         
+        # 首先检查目标存储中是否已存在该文件（仅当skip_existing为True时）
+        if self.skip_existing:
+            try:
+                # 检查是否为文件夹（S3中通常以"/"结尾）
+                if key.endswith('/'):
+                    # 文件夹对象，直接处理
+                    pass
+                else:
+                    # 尝试检查文件是否已存在
+                    try:
+                        # 使用head_object检查文件是否存在
+                        response = retry_operation(
+                            self.target_client.head_object,
+                            Bucket=bucket_name,
+                            Key=key
+                        )
+                        
+                        # 如果执行到这里，说明文件存在，检查大小是否一致
+                        target_size = response.get('ContentLength', 0)
+                        
+                        # 如果大小一致，则认为是相同文件，跳过
+                        if target_size == size:
+                            logger.info(f"文件已存在且大小一致，跳过: {key} (大小: {self._format_size(size)})")
+                            return True, size
+                        else:
+                            logger.info(f"文件已存在但大小不一致，将覆盖: {key} (源: {self._format_size(size)}, 目标: {self._format_size(target_size)})")
+                    except ClientError as e:
+                        # 文件不存在，继续上传
+                        error_code = e.response.get('Error', {}).get('Code')
+                        if error_code == 'NoSuchKey' or error_code == '404' or error_code == '403':
+                            # 文件不存在，继续处理
+                            pass
+                        else:
+                            # 其他错误
+                            raise
+            except Exception as e:
+                # 检查过程中出错，记录日志但继续尝试上传
+                logger.warning(f"检查文件 {key} 是否存在时出错: {str(e)}")
+        
         # 如果配置了直接读取模式，或者文件大小在可接受范围内
         if self.direct_read or size <= self.max_direct_size:
             try:
@@ -388,6 +430,30 @@ class S3Migrator:
         Returns:
             成功标志和对象大小的元组
         """
+        # 再次检查文件是否已存在，因为可能在_copy_object方法判断后状态已变化（仅当skip_existing为True时）
+        if self.skip_existing:
+            try:
+                # 跳过文件夹对象
+                if not key.endswith('/'):
+                    try:
+                        response = retry_operation(
+                            self.target_client.head_object,
+                            Bucket=bucket_name,
+                            Key=key
+                        )
+                        target_size = response.get('ContentLength', 0)
+                        if target_size == size:
+                            logger.info(f"大文件已存在且大小一致，跳过分块上传: {key} (大小: {self._format_size(size)})")
+                            return True, size
+                        else:
+                            logger.info(f"大文件已存在但大小不一致，将覆盖: {key} (源: {self._format_size(size)}, 目标: {self._format_size(target_size)})")
+                    except ClientError as e:
+                        error_code = e.response.get('Error', {}).get('Code')
+                        if error_code not in ['NoSuchKey', '404', '403']:
+                            raise
+            except Exception as e:
+                logger.warning(f"检查大文件 {key} 是否存在时出错: {str(e)}")
+        
         try:
             logger.info(f"开始分块复制大文件: {key} (大小: {self._format_size(size)})")
             
@@ -535,7 +601,8 @@ def load_config(config_file: str) -> Dict:
         "chunk_size": config.getint("migration", "chunk_size", fallback=8*1024*1024),
         "is_source_r2": config.getboolean("source", "is_r2", fallback=False),
         "direct_read": config.getboolean("source", "direct_read", fallback=False),
-        "max_direct_size": config.getint("source", "max_direct_size", fallback=500*1024*1024)
+        "max_direct_size": config.getint("source", "max_direct_size", fallback=500*1024*1024),
+        "skip_existing": config.getboolean("source", "skip_existing", fallback=True)
     }
     
     return result
@@ -555,6 +622,7 @@ def parse_arguments():
     parser.add_argument('--is-source-r2', action='store_true', help='源存储是否为Cloudflare R2')
     parser.add_argument('--direct-read', action='store_true', help='是否直接读取所有文件，不使用分块处理')
     parser.add_argument('--max-direct-size', type=int, default=500*1024*1024, help='直接读取的最大文件大小，超过此大小的文件使用分块上传 (默认: 500MB)')
+    parser.add_argument('--no-skip-existing', action='store_true', help='是否不跳过目标存储中已存在的文件，强制重新上传')
     
     # S3目标配置
     parser.add_argument('--target-endpoint', help='目标S3端点URL')
@@ -607,6 +675,7 @@ def main():
     is_source_r2 = args.is_source_r2 or config.get("is_source_r2", False)
     direct_read = args.direct_read or config.get("direct_read", False)
     max_direct_size = args.max_direct_size if args.max_direct_size != 500*1024*1024 else config.get("max_direct_size", 500*1024*1024)
+    skip_existing = not args.no_skip_existing if hasattr(args, 'no_skip_existing') else config.get("skip_existing", True)
     
     # 验证必要的参数是否存在
     missing_args = []
@@ -643,7 +712,8 @@ def main():
         chunk_size=chunk_size,
         is_source_r2=is_source_r2,
         direct_read=direct_read,
-        max_direct_size=max_direct_size
+        max_direct_size=max_direct_size,
+        skip_existing=skip_existing
     )
     
     # 执行迁移

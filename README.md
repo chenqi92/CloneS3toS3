@@ -65,6 +65,19 @@ python main.py --source-endpoint SOURCE_S3_URL \
                --direct-read
 ```
 
+如果需要强制重新上传所有文件，即使目标存储中已存在，添加`--no-skip-existing`参数：
+
+```bash
+python main.py --source-endpoint SOURCE_S3_URL \
+               --source-access-key SOURCE_ACCESS_KEY \
+               --source-secret-key SOURCE_SECRET_KEY \
+               --target-endpoint TARGET_S3_URL \
+               --target-access-key TARGET_ACCESS_KEY \
+               --target-secret-key TARGET_SECRET_KEY \
+               --buckets "my-bucket" \
+               --no-skip-existing
+```
+
 ### 2. 使用配置文件
 
 创建一个配置文件，例如 `config.ini`（可以参考 `config.example.ini` 创建）:
@@ -77,6 +90,7 @@ secret_key = source_secret_key
 is_r2 = false  # 设置为true表示源存储为Cloudflare R2
 direct_read = true  # 设置为true表示直接读取文件而不使用分块方式
 max_direct_size = 524288000  # 直接读取的最大文件大小，超过此大小使用分块上传 (默认: 500MB)
+skip_existing = true  # 设置为true表示跳过目标存储中已存在的文件
 
 [target]
 endpoint = http://target-s3.example.com
@@ -114,6 +128,7 @@ python main.py --config config.ini --max-workers 20 --direct-read
 | `--is-source-r2` | 源存储是否为Cloudflare R2 | 否 |
 | `--direct-read` | 是否直接读取文件而不使用分块方式 | 否 |
 | `--max-direct-size` | 直接读取的最大文件大小，超过此大小使用分块上传 (默认: 500MB) | 否 |
+| `--no-skip-existing` | 是否不跳过目标存储中已存在的文件，强制重新上传 | 否 |
 | `--target-endpoint` | 目标S3端点URL | 是* |
 | `--target-access-key` | 目标S3访问密钥 | 是* |
 | `--target-secret-key` | 目标S3秘密密钥 | 是* |
@@ -144,6 +159,21 @@ python main.py --config config.ini --max-workers 20 --direct-read
 - 迁移大量大文件时节省内存
 - 源存储支持Range请求
 - 需要在上传过程中显示详细进度
+
+### 3. 文件跳过模式（默认）
+
+默认情况下，迁移工具会检查目标存储中是否已存在相同的文件。判断标准是：
+- 文件路径完全相同
+- 文件大小完全相同
+
+如果发现目标存储中已有相同文件，工具会自动跳过，避免重复上传，从而提高迁移效率。这对于以下情况特别有用：
+- 迁移过程中断需要重新开始
+- 增量迁移，只迁移新增或修改的文件
+- 多次同步更新场景
+
+如果需要强制重新上传所有文件，可以：
+- 在命令行参数中添加`--no-skip-existing`标志
+- 在配置文件的`[source]`部分设置`skip_existing = false`
 
 ## Cloudflare R2 特殊支持
 
@@ -246,7 +276,7 @@ python main.py --source-endpoint "http://source-s3.example.com" \
 
 ```bash
 # 创建配置文件
-cp config.example.ini config.ini
+cp config.template.ini config.ini
 # 编辑 config.ini 设置必要参数
 # 运行程序，使用命令行覆盖某些配置
 python main.py --config config.ini --max-workers 15
@@ -311,7 +341,7 @@ python migrate_example.py
 使用标准UTF-8编码的配置文件模板，避免编码问题：
 
 ```bash
-cp config.example.ini config.ini
+cp config.template.ini config.ini
 # 然后编辑config.ini文件填入您的配置
 ```
 

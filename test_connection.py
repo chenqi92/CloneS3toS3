@@ -46,12 +46,56 @@ def test_bucket_access(client, bucket_name):
         response = client.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
         logger.info(f"成功访问存储桶 {bucket_name}")
         
-        # 检查是否有对象
-        if 'Contents' in response:
-            first_object = response['Contents'][0]['Key'] if response['Contents'] else "无对象"
-            logger.info(f"存储桶中的第一个对象: {first_object}")
-        else:
-            logger.info(f"存储桶 {bucket_name} 为空")
+        # 获取存储桶中的对象数量
+        try:
+            paginator = client.get_paginator('list_objects_v2')
+            page_iterator = paginator.paginate(Bucket=bucket_name)
+            
+            total_objects = 0
+            total_size = 0
+            
+            # 取前5个对象作为示例
+            example_objects = []
+            
+            for page in page_iterator:
+                if 'Contents' in page:
+                    for obj in page['Contents']:
+                        total_objects += 1
+                        if 'Size' in obj:
+                            total_size += obj['Size']
+                        
+                        if len(example_objects) < 5:
+                            example_objects.append(obj['Key'])
+            
+            logger.info(f"存储桶 {bucket_name} 中共有 {total_objects} 个对象")
+            
+            if total_size > 0:
+                # 格式化文件大小
+                def format_size(size_bytes):
+                    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                        if size_bytes < 1024.0:
+                            return f"{size_bytes:.2f} {unit}"
+                        size_bytes /= 1024.0
+                    return f"{size_bytes:.2f} PB"
+                
+                logger.info(f"存储桶 {bucket_name} 总大小约为 {format_size(total_size)}")
+            
+            if example_objects:
+                logger.info(f"对象示例: {', '.join(example_objects[:5])}")
+                if total_objects > 5:
+                    logger.info(f"... 等 {total_objects - 5} 个其他对象")
+            else:
+                logger.info(f"存储桶 {bucket_name} 为空")
+                
+        except Exception as e:
+            logger.warning(f"获取存储桶 {bucket_name} 内对象信息时出错: {str(e)}")
+            
+            # 至少显示一个对象信息
+            if 'Contents' in response and response['Contents']:
+                first_object = response['Contents'][0]['Key']
+                logger.info(f"存储桶中的第一个对象: {first_object}")
+            else:
+                logger.info(f"存储桶 {bucket_name} 为空")
         
         return True
     except ClientError as e:
