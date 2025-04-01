@@ -100,7 +100,9 @@ class S3Migrator:
         bucket_names: List[str],
         max_workers: int = 10,
         chunk_size: int = 8 * 1024 * 1024,  # 8MB
-        is_source_r2: bool = False
+        is_source_r2: bool = False,
+        direct_read: bool = False,
+        max_direct_size: int = 500 * 1024 * 1024  # 默认500MB，超过此大小的文件使用分块上传
     ):
         """
         初始化S3迁移器
@@ -116,6 +118,8 @@ class S3Migrator:
             max_workers: 最大工作线程数
             chunk_size: 分块上传大小
             is_source_r2: 源存储是否是Cloudflare R2
+            direct_read: 是否直接读取所有文件，不使用分块处理
+            max_direct_size: 直接读取的最大文件大小，超过此大小的文件使用分块上传
         """
         self.source_endpoint = source_endpoint
         self.source_access_key = source_access_key
@@ -129,6 +133,8 @@ class S3Migrator:
         self.max_workers = max_workers
         self.chunk_size = chunk_size
         self.is_source_r2 = is_source_r2
+        self.direct_read = direct_read
+        self.max_direct_size = max_direct_size
         
         # 初始化源S3客户端
         self.source_client = boto3.client(
@@ -331,195 +337,48 @@ class S3Migrator:
         key = obj['Key']
         size = obj['Size']
         
-        # 针对Cloudflare R2的特殊处理
-        if self.is_source_r2:
-            # 尝试直接获取对象数据而不是使用head_object
+        # 如果配置了直接读取模式，或者文件大小在可接受范围内
+        if self.direct_read or size <= self.max_direct_size:
             try:
-                # 对于小文件，直接尝试获取整个对象
-                if size < self.chunk_size:
-                    response = retry_operation(
-                        self.source_client.get_object,
-                        Bucket=bucket_name,
-                        Key=key
-                    )
-                    
-                    # 获取对象内容
-                    data = response['Body'].read()
-                    
-                    # 上传到目标
-                    retry_operation(
-                        self.target_client.put_object,
-                        Bucket=bucket_name,
-                        Key=key,
-                        Body=data
-                    )
-                    
-                    return True, size
-                else:
-                    # 对于大文件，使用分块上传
-                    return self._multipart_copy_for_r2(bucket_name, key, size)
-            except ClientError as e:
-                error_code = e.response.get('Error', {}).get('Code')
-                if error_code == 'NoSuchKey' or error_code == '404':
-                    logger.warning(f"R2存储: 复制对象 {key} 时出错: 文件不存在 (NoSuchKey)")
-                else:
-                    logger.error(f"R2存储: 复制对象 {key} 时出错: {error_code} - {str(e)}")
-                return False, 0
-            except Exception as e:
-                logger.error(f"R2存储: 复制对象 {key} 时出错: {str(e)}")
-                return False, 0
-        
-        # 原来的逻辑，用于非R2存储
-        # 对于小文件，使用简单复制
-        if size < self.chunk_size:
-            try:
-                # 先检查源对象是否存在
-                try:
-                    retry_operation(self.source_client.head_object, Bucket=bucket_name, Key=key)
-                except ClientError as e:
-                    error_code = e.response.get('Error', {}).get('Code')
-                    if error_code == 'NoSuchKey' or error_code == '404':
-                        logger.warning(f"源对象 {key} 不存在，已跳过")
-                        return False, 0
-                    else:
-                        # 其他错误继续抛出
-                        raise
+                logger.info(f"开始直接复制对象: {key} (大小: {self._format_size(size)})")
                 
-                # 执行复制
-                copy_source = {'Bucket': bucket_name, 'Key': key}
-                retry_operation(
-                    self.target_client.copy_object,
-                    CopySource=copy_source,
+                # 直接获取对象内容
+                response = retry_operation(
+                    self.source_client.get_object,
                     Bucket=bucket_name,
                     Key=key
                 )
+                
+                # 读取对象数据
+                data = response['Body'].read()
+                
+                # 上传到目标存储
+                retry_operation(
+                    self.target_client.put_object,
+                    Bucket=bucket_name,
+                    Key=key,
+                    Body=data
+                )
+                
+                logger.info(f"成功复制对象: {key}")
                 return True, size
             except ClientError as e:
                 error_code = e.response.get('Error', {}).get('Code')
                 if error_code == 'NoSuchKey' or error_code == '404':
                     logger.warning(f"复制对象 {key} 时出错: 文件不存在 (NoSuchKey)")
                 else:
-                    logger.error(f"复制对象 {key} 时出错: {str(e)}")
+                    logger.error(f"复制对象 {key} 时出错: {error_code} - {str(e)}")
                 return False, 0
             except Exception as e:
                 logger.error(f"复制对象 {key} 时出错: {str(e)}")
                 return False, 0
-        
-        # 对于大文件，使用分块上传
         else:
-            try:
-                # 先检查源对象是否存在
-                try:
-                    retry_operation(self.source_client.head_object, Bucket=bucket_name, Key=key)
-                except ClientError as e:
-                    error_code = e.response.get('Error', {}).get('Code')
-                    if error_code == 'NoSuchKey' or error_code == '404':
-                        logger.warning(f"源对象 {key} 不存在，已跳过")
-                        return False, 0
-                    else:
-                        # 其他错误继续抛出
-                        raise
-                
-                # 初始化分块上传
-                multipart_upload = retry_operation(
-                    self.target_client.create_multipart_upload,
-                    Bucket=bucket_name,
-                    Key=key
-                )
-                upload_id = multipart_upload['UploadId']
-                
-                # 计算分块数量
-                part_count = (size + self.chunk_size - 1) // self.chunk_size
-                
-                # 上传每个分块
-                parts = []
-                for i in range(part_count):
-                    start_byte = i * self.chunk_size
-                    end_byte = min(start_byte + self.chunk_size - 1, size - 1)
-                    
-                    # 从源获取并上传到目标
-                    part_number = i + 1
-                    range_str = f'bytes={start_byte}-{end_byte}'
-                    
-                    try:
-                        # 获取源对象的一部分
-                        response = retry_operation(
-                            self.source_client.get_object,
-                            Bucket=bucket_name,
-                            Key=key,
-                            Range=range_str
-                        )
-                        
-                        # 上传分块
-                        part = retry_operation(
-                            self.target_client.upload_part,
-                            Body=response['Body'].read(),
-                            Bucket=bucket_name,
-                            Key=key,
-                            PartNumber=part_number,
-                            UploadId=upload_id
-                        )
-                        
-                        parts.append({
-                            'ETag': part['ETag'],
-                            'PartNumber': part_number
-                        })
-                    except ClientError as e:
-                        error_code = e.response.get('Error', {}).get('Code')
-                        if error_code == 'NoSuchKey' or error_code == '404':
-                            logger.warning(f"获取对象 {key} 分块 {part_number} 时出错: 文件不存在 (NoSuchKey)")
-                            raise  # 重新抛出错误以触发中止上传
-                        else:
-                            raise
-                
-                # 完成分块上传
-                retry_operation(
-                    self.target_client.complete_multipart_upload,
-                    Bucket=bucket_name,
-                    Key=key,
-                    MultipartUpload={'Parts': parts},
-                    UploadId=upload_id
-                )
-                
-                return True, size
-            except ClientError as e:
-                # 处理特定错误
-                error_code = e.response.get('Error', {}).get('Code')
-                if error_code == 'NoSuchKey' or error_code == '404':
-                    logger.warning(f"分块上传对象 {key} 时出错: 文件不存在 (NoSuchKey)")
-                else:
-                    logger.error(f"分块上传对象 {key} 时出错: {error_code} - {str(e)}")
-                
-                # 尝试中止分块上传
-                try:
-                    if 'upload_id' in locals():
-                        retry_operation(
-                            self.target_client.abort_multipart_upload,
-                            Bucket=bucket_name,
-                            Key=key,
-                            UploadId=upload_id
-                        )
-                except Exception as abort_error:
-                    logger.error(f"中止分块上传时出错: {str(abort_error)}")
-                return False, 0
-            except Exception as e:
-                # 出错时，尝试中止分块上传
-                logger.error(f"分块上传对象 {key} 时出错: {str(e)}")
-                try:
-                    if 'upload_id' in locals():
-                        retry_operation(
-                            self.target_client.abort_multipart_upload,
-                            Bucket=bucket_name,
-                            Key=key,
-                            UploadId=upload_id
-                        )
-                except Exception as abort_error:
-                    logger.error(f"中止分块上传时出错: {str(abort_error)}")
-                return False, 0
+            # 对于超大文件，使用分块上传
+            return self._multipart_copy(bucket_name, key, size)
     
-    def _multipart_copy_for_r2(self, bucket_name: str, key: str, size: int) -> Tuple[bool, int]:
+    def _multipart_copy(self, bucket_name: str, key: str, size: int) -> Tuple[bool, int]:
         """
-        针对R2的大文件分块复制方法
+        大文件分块复制方法
         
         Args:
             bucket_name: 桶名称
@@ -530,6 +389,8 @@ class S3Migrator:
             成功标志和对象大小的元组
         """
         try:
+            logger.info(f"开始分块复制大文件: {key} (大小: {self._format_size(size)})")
+            
             # 初始化分块上传
             multipart_upload = retry_operation(
                 self.target_client.create_multipart_upload,
@@ -574,8 +435,11 @@ class S3Migrator:
                         'ETag': part['ETag'],
                         'PartNumber': part_number
                     })
+                    
+                    if part_number % 10 == 0 or part_number == part_count:
+                        logger.info(f"分块上传进度 {key}: {part_number}/{part_count} ({part_number/part_count*100:.1f}%)")
                 except Exception as e:
-                    logger.error(f"R2存储: 获取并上传对象 {key} 分块 {part_number} 时出错: {str(e)}")
+                    logger.error(f"上传分块 {part_number}/{part_count} 时出错: {str(e)}")
                     raise
             
             # 完成分块上传
@@ -587,9 +451,10 @@ class S3Migrator:
                 UploadId=upload_id
             )
             
+            logger.info(f"成功分块复制大文件: {key}")
             return True, size
         except Exception as e:
-            logger.error(f"R2存储: 分块上传对象 {key} 时出错: {str(e)}")
+            logger.error(f"分块上传对象 {key} 时出错: {str(e)}")
             # 尝试中止分块上传
             try:
                 if 'upload_id' in locals():
@@ -630,7 +495,25 @@ def load_config(config_file: str) -> Dict:
         return {}
     
     config = configparser.ConfigParser()
-    config.read(config_file)
+    
+    # 尝试使用UTF-8编码读取
+    try:
+        with open(config_file, 'r', encoding='utf-8') as f:
+            config.read_file(f)
+            logger.info(f"成功使用UTF-8编码读取配置文件: {config_file}")
+    except UnicodeDecodeError:
+        # 尝试使用GBK编码
+        try:
+            with open(config_file, 'r', encoding='gbk') as f:
+                config.read_file(f)
+                logger.info(f"成功使用GBK编码读取配置文件: {config_file}")
+        except Exception as e:
+            logger.error(f"无法读取配置文件 {config_file}: {str(e)}")
+            logger.error("请尝试运行 'python fix_encoding.py' 修复配置文件编码问题")
+            return {}
+    except Exception as e:
+        logger.error(f"读取配置文件时出错: {str(e)}")
+        return {}
     
     # 验证必要的配置部分是否存在
     required_sections = ["source", "target", "migration"]
@@ -650,7 +533,9 @@ def load_config(config_file: str) -> Dict:
         "buckets": [b.strip() for b in config.get("migration", "buckets").split(",") if b.strip()],
         "max_workers": config.getint("migration", "max_workers", fallback=10),
         "chunk_size": config.getint("migration", "chunk_size", fallback=8*1024*1024),
-        "is_source_r2": config.getboolean("source", "is_r2", fallback=False)
+        "is_source_r2": config.getboolean("source", "is_r2", fallback=False),
+        "direct_read": config.getboolean("source", "direct_read", fallback=False),
+        "max_direct_size": config.getint("source", "max_direct_size", fallback=500*1024*1024)
     }
     
     return result
@@ -668,6 +553,8 @@ def parse_arguments():
     parser.add_argument('--source-access-key', help='源S3访问密钥')
     parser.add_argument('--source-secret-key', help='源S3秘密密钥')
     parser.add_argument('--is-source-r2', action='store_true', help='源存储是否为Cloudflare R2')
+    parser.add_argument('--direct-read', action='store_true', help='是否直接读取所有文件，不使用分块处理')
+    parser.add_argument('--max-direct-size', type=int, default=500*1024*1024, help='直接读取的最大文件大小，超过此大小的文件使用分块上传 (默认: 500MB)')
     
     # S3目标配置
     parser.add_argument('--target-endpoint', help='目标S3端点URL')
@@ -718,6 +605,8 @@ def main():
     max_workers = args.max_workers if args.max_workers != 10 else config.get("max_workers", 10)
     chunk_size = args.chunk_size if args.chunk_size != 8*1024*1024 else config.get("chunk_size", 8*1024*1024)
     is_source_r2 = args.is_source_r2 or config.get("is_source_r2", False)
+    direct_read = args.direct_read or config.get("direct_read", False)
+    max_direct_size = args.max_direct_size if args.max_direct_size != 500*1024*1024 else config.get("max_direct_size", 500*1024*1024)
     
     # 验证必要的参数是否存在
     missing_args = []
@@ -752,7 +641,9 @@ def main():
         bucket_names=bucket_names,
         max_workers=max_workers,
         chunk_size=chunk_size,
-        is_source_r2=is_source_r2
+        is_source_r2=is_source_r2,
+        direct_read=direct_read,
+        max_direct_size=max_direct_size
     )
     
     # 执行迁移
