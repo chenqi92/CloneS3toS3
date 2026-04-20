@@ -120,13 +120,17 @@ def main():
     try:
         # 加载配置
         config = load_config(args.config)
+        if not config:
+            logger.error("配置加载失败")
+            return
         
         # 获取测试的存储桶列表
         if args.buckets:
-            buckets = args.buckets.split(',')
-        elif 'migration' in config and 'buckets' in config['migration']:
-            buckets = config['migration']['buckets'].split(',')
+            buckets = [bucket.strip() for bucket in args.buckets.split(',') if bucket.strip()]
         else:
+            buckets = config.get('buckets', [])
+
+        if not buckets:
             logger.error("未指定要测试的存储桶。请在配置文件中添加buckets参数或使用--buckets参数指定")
             return
         
@@ -134,15 +138,15 @@ def main():
         if not args.target_only:
             logger.info("===== 测试源存储连接 =====")
             source_client = create_s3_client(
-                config['source']['endpoint'],
-                config['source']['access_key'],
-                config['source']['secret_key']
+                config['source_endpoint'],
+                config['source_access_key'],
+                config['source_secret_key']
             )
             
             if source_client:
                 logger.info("源存储连接创建成功")
                 for bucket in buckets:
-                    test_bucket_access(source_client, bucket.strip())
+                    test_bucket_access(source_client, bucket)
             else:
                 logger.error("无法连接到源存储")
         
@@ -150,15 +154,15 @@ def main():
         if not args.source_only:
             logger.info("\n===== 测试目标存储连接 =====")
             target_client = create_s3_client(
-                config['target']['endpoint'],
-                config['target']['access_key'],
-                config['target']['secret_key']
+                config['target_endpoint'],
+                config['target_access_key'],
+                config['target_secret_key']
             )
             
             if target_client:
                 logger.info("目标存储连接创建成功")
                 for bucket in buckets:
-                    test_bucket_access(target_client, bucket.strip())
+                    test_bucket_access(target_client, bucket)
             else:
                 logger.error("无法连接到目标存储")
                 

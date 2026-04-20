@@ -39,6 +39,16 @@ RETRIABLE_ERROR_CODES = [
     'ReadTimeoutError'
 ]
 
+TAGGING_UNSUPPORTED_ERROR_CODES = {
+    'NotImplemented',
+    'UnsupportedOperation',
+    'UnsupportedHeader',
+    'MethodNotAllowed',
+    'InvalidRequest',
+    'XNotImplemented',
+    '501'
+}
+
 def retry_operation(func: Callable, *args, max_retries: int = 3, retry_delay: int = 2, **kwargs):
     """
     重试操作函数，用于在出现临时错误时重试
@@ -138,6 +148,8 @@ class S3Migrator:
         self.direct_read = direct_read
         self.max_direct_size = max_direct_size
         self.skip_existing = skip_existing
+        self.source_tagging_supported = True
+        self.target_tagging_supported = True
         
         # 初始化源S3客户端
         self.source_client = boto3.client(
@@ -325,6 +337,127 @@ class S3Migrator:
                 objects.extend(page['Contents'])
         
         return objects
+
+    @staticmethod
+    def _build_upload_extra_args(object_info: Dict) -> Dict:
+        """从源对象响应中提取可复制到目标对象的常见元数据和HTTP头。"""
+        extra_args = {}
+        transferable_fields = [
+            'CacheControl',
+            'ContentDisposition',
+            'ContentEncoding',
+            'ContentLanguage',
+            'ContentType',
+            'Expires',
+            'WebsiteRedirectLocation'
+        ]
+
+        for field in transferable_fields:
+            value = object_info.get(field)
+            if value not in (None, ''):
+                extra_args[field] = value
+
+        metadata = object_info.get('Metadata')
+        if metadata is not None:
+            extra_args['Metadata'] = metadata
+
+        return extra_args
+
+    def _get_source_object_info(self, bucket_name: str, key: str) -> Dict:
+        """获取源对象的元数据信息，用于构造目标对象。"""
+        try:
+            return retry_operation(
+                self.source_client.head_object,
+                Bucket=bucket_name,
+                Key=key
+            )
+        except Exception as e:
+            logger.warning(f"获取源对象 {key} 的元数据失败，将使用默认上传参数: {str(e)}")
+            return {}
+
+    @staticmethod
+    def _is_tagging_unsupported(error: ClientError) -> bool:
+        """判断当前存储是否不支持对象标签接口。"""
+        error_code = error.response.get('Error', {}).get('Code', '')
+        error_message = error.response.get('Error', {}).get('Message', '').lower()
+
+        if error_code in TAGGING_UNSUPPORTED_ERROR_CODES:
+            return True
+
+        unsupported_markers = [
+            'tagging is not supported',
+            'object tagging is not supported',
+            'not implemented',
+            'unsupported'
+        ]
+
+        return any(marker in error_message for marker in unsupported_markers)
+
+    def _get_source_object_tags(self, bucket_name: str, key: str) -> Optional[List[Dict]]:
+        """读取源对象标签。返回None表示源端不支持标签接口。"""
+        if not self.source_tagging_supported:
+            return None
+
+        try:
+            response = retry_operation(
+                self.source_client.get_object_tagging,
+                Bucket=bucket_name,
+                Key=key
+            )
+            return response.get('TagSet', [])
+        except ClientError as e:
+            if self._is_tagging_unsupported(e):
+                if self.source_tagging_supported:
+                    logger.warning("源存储不支持对象标签接口，将跳过标签复制")
+                self.source_tagging_supported = False
+                return None
+            raise
+
+    def _apply_target_object_tags(self, bucket_name: str, key: str, tag_set: List[Dict]) -> bool:
+        """把标签写入目标对象。"""
+        if not self.target_tagging_supported:
+            return True
+
+        try:
+            if tag_set:
+                retry_operation(
+                    self.target_client.put_object_tagging,
+                    Bucket=bucket_name,
+                    Key=key,
+                    Tagging={'TagSet': tag_set}
+                )
+            else:
+                retry_operation(
+                    self.target_client.delete_object_tagging,
+                    Bucket=bucket_name,
+                    Key=key
+                )
+            return True
+        except ClientError as e:
+            if self._is_tagging_unsupported(e):
+                if self.target_tagging_supported:
+                    logger.warning("目标存储不支持对象标签接口，将跳过标签写入")
+                self.target_tagging_supported = False
+                return True
+            logger.error(f"写入目标对象 {key} 标签时出错: {e.response.get('Error', {}).get('Code')} - {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"写入目标对象 {key} 标签时出错: {str(e)}")
+            return False
+
+    def _sync_object_tags(self, bucket_name: str, key: str) -> bool:
+        """同步单个对象的标签到目标存储。"""
+        try:
+            tag_set = self._get_source_object_tags(bucket_name, key)
+            if tag_set is None:
+                return True
+            return self._apply_target_object_tags(bucket_name, key, tag_set)
+        except ClientError as e:
+            logger.error(f"读取源对象 {key} 标签时出错: {e.response.get('Error', {}).get('Code')} - {str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"同步对象 {key} 标签时出错: {str(e)}")
+            return False
     
     def _copy_object(self, bucket_name: str, obj: Dict) -> Tuple[bool, int]:
         """
@@ -362,7 +495,9 @@ class S3Migrator:
                         
                         # 如果大小一致，则认为是相同文件，跳过
                         if target_size == size:
-                            logger.info(f"文件已存在且大小一致，跳过: {key} (大小: {self._format_size(size)})")
+                            if not self._sync_object_tags(bucket_name, key):
+                                return False, 0
+                            logger.info(f"文件已存在且大小一致，已同步标签并跳过: {key} (大小: {self._format_size(size)})")
                             return True, size
                         else:
                             logger.info(f"文件已存在但大小不一致，将覆盖: {key} (源: {self._format_size(size)}, 目标: {self._format_size(target_size)})")
@@ -393,14 +528,19 @@ class S3Migrator:
                 
                 # 读取对象数据
                 data = response['Body'].read()
+                upload_extra_args = self._build_upload_extra_args(response)
                 
                 # 上传到目标存储
                 retry_operation(
                     self.target_client.put_object,
                     Bucket=bucket_name,
                     Key=key,
-                    Body=data
+                    Body=data,
+                    **upload_extra_args
                 )
+
+                if not self._sync_object_tags(bucket_name, key):
+                    return False, 0
                 
                 logger.info(f"成功复制对象: {key}")
                 return True, size
@@ -443,7 +583,9 @@ class S3Migrator:
                         )
                         target_size = response.get('ContentLength', 0)
                         if target_size == size:
-                            logger.info(f"大文件已存在且大小一致，跳过分块上传: {key} (大小: {self._format_size(size)})")
+                            if not self._sync_object_tags(bucket_name, key):
+                                return False, 0
+                            logger.info(f"大文件已存在且大小一致，已同步标签并跳过分块上传: {key} (大小: {self._format_size(size)})")
                             return True, size
                         else:
                             logger.info(f"大文件已存在但大小不一致，将覆盖: {key} (源: {self._format_size(size)}, 目标: {self._format_size(target_size)})")
@@ -456,12 +598,15 @@ class S3Migrator:
         
         try:
             logger.info(f"开始分块复制大文件: {key} (大小: {self._format_size(size)})")
+            source_object_info = self._get_source_object_info(bucket_name, key)
+            upload_extra_args = self._build_upload_extra_args(source_object_info)
             
             # 初始化分块上传
             multipart_upload = retry_operation(
                 self.target_client.create_multipart_upload,
                 Bucket=bucket_name,
-                Key=key
+                Key=key,
+                **upload_extra_args
             )
             upload_id = multipart_upload['UploadId']
             
@@ -516,6 +661,9 @@ class S3Migrator:
                 MultipartUpload={'Parts': parts},
                 UploadId=upload_id
             )
+
+            if not self._sync_object_tags(bucket_name, key):
+                return False, 0
             
             logger.info(f"成功分块复制大文件: {key}")
             return True, size
