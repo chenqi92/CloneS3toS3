@@ -28,13 +28,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def list_all_objects(client, bucket_name: str) -> Dict[str, int]:
+def list_all_objects(client, bucket_name: str, label: str = "") -> Dict[str, int]:
     """
     使用显式分页 + v1 回退列出桶中所有对象，返回 {key: size}。
+    带进度日志、token环路检测、最大页数硬限制。
     """
     objects: Dict[str, int] = {}
     continuation_token: Optional[str] = None
     page_count = 0
+    seen_tokens = set()
+    last_key_on_page: Optional[str] = None
+    MAX_PAGES = 10000  # 硬上限：1000万对象
+
+    tag = f"[{label}]" if label else ""
 
     while True:
         kwargs = {'Bucket': bucket_name, 'MaxKeys': 1000}
@@ -47,30 +53,54 @@ def list_all_objects(client, bucket_name: str) -> Dict[str, int]:
         for obj in contents:
             objects[obj['Key']] = obj['Size']
 
+        new_last_key = contents[-1]['Key'] if contents else None
+        if page_count % 10 == 0 or page_count <= 3:
+            logger.info(
+                f"{tag} 桶 {bucket_name} 第 {page_count} 页: 本页 {len(contents)} 条, "
+                f"累计 {len(objects)} 个对象, 本页末key={new_last_key}"
+            )
+
         if not response.get('IsTruncated', False):
             break
 
+        if page_count >= MAX_PAGES:
+            logger.error(f"{tag} 桶 {bucket_name} 达到最大页数上限 {MAX_PAGES}，强制停止")
+            break
+
         next_token = response.get('NextContinuationToken')
+
+        # 三层环路检测
+        cycle_reason = None
         if not next_token:
+            cycle_reason = "缺少 NextContinuationToken"
+        elif next_token in seen_tokens:
+            cycle_reason = f"NextContinuationToken 已出现过 (检测到分页环路)"
+        elif contents and new_last_key == last_key_on_page:
+            cycle_reason = f"本页末key与上一页相同 ({new_last_key})，疑似原地循环"
+
+        if cycle_reason:
             logger.warning(
-                f"桶 {bucket_name} v2 分页第 {page_count} 页缺少 NextContinuationToken，"
-                f"已列 {len(objects)} 个对象，回退到 v1"
+                f"{tag} 桶 {bucket_name} v2 分页第 {page_count} 页 {cycle_reason}，"
+                f"已列 {len(objects)} 个对象，回退到 v1 从 marker={new_last_key} 继续"
             )
-            last_key = contents[-1]['Key'] if contents else None
-            v1_objs = _list_v1(client, bucket_name, start_marker=last_key)
+            v1_objs = _list_v1(client, bucket_name, start_marker=new_last_key, label=label)
             objects.update(v1_objs)
             break
 
+        seen_tokens.add(next_token)
+        last_key_on_page = new_last_key
         continuation_token = next_token
 
     logger.info(f"桶 {bucket_name} 通过 {page_count} 页 v2 共列出 {len(objects)} 个对象")
     return objects
 
 
-def _list_v1(client, bucket_name: str, start_marker: Optional[str] = None) -> Dict[str, int]:
+def _list_v1(client, bucket_name: str, start_marker: Optional[str] = None, label: str = "") -> Dict[str, int]:
     objects: Dict[str, int] = {}
     marker = start_marker
     page_count = 0
+    MAX_PAGES = 10000
+    tag = f"[{label}]" if label else ""
 
     while True:
         kwargs = {'Bucket': bucket_name, 'MaxKeys': 1000}
@@ -83,18 +113,24 @@ def _list_v1(client, bucket_name: str, start_marker: Optional[str] = None) -> Di
         for obj in contents:
             objects[obj['Key']] = obj['Size']
 
+        if page_count % 10 == 0 or page_count <= 3:
+            logger.info(f"{tag} 桶 {bucket_name} v1 第 {page_count} 页: 累计 {len(objects)}")
+
         if not response.get('IsTruncated', False):
+            break
+        if page_count >= MAX_PAGES:
+            logger.error(f"{tag} 桶 {bucket_name} v1 达到最大页数 {MAX_PAGES}，强制停止")
             break
 
         next_marker = response.get('NextMarker')
         if not next_marker and contents:
             next_marker = contents[-1]['Key']
         if not next_marker or next_marker == marker:
-            logger.error(f"桶 {bucket_name} v1 marker 无法推进，终止")
+            logger.error(f"{tag} 桶 {bucket_name} v1 marker 无法推进，终止")
             break
         marker = next_marker
 
-    logger.info(f"桶 {bucket_name} v1 补齐 {page_count} 页，共 {len(objects)} 个对象")
+    logger.info(f"{tag} 桶 {bucket_name} v1 补齐 {page_count} 页，共 {len(objects)} 个对象")
     return objects
 
 
@@ -109,8 +145,8 @@ def format_size(size_bytes: int) -> str:
 def compare_bucket(source_client, target_client, bucket_name: str) -> bool:
     logger.info(f"===== 校验桶: {bucket_name} =====")
 
-    src = list_all_objects(source_client, bucket_name)
-    dst = list_all_objects(target_client, bucket_name)
+    src = list_all_objects(source_client, bucket_name, label="源")
+    dst = list_all_objects(target_client, bucket_name, label="目标")
 
     src_count, src_size = len(src), sum(src.values())
     dst_count, dst_size = len(dst), sum(dst.values())

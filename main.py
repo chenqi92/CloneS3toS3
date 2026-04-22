@@ -360,13 +360,13 @@ class S3Migrator:
                 break
 
             next_token = response.get('NextContinuationToken')
-            if not next_token:
+            if not next_token or next_token == continuation_token:
+                reason = "缺少 NextContinuationToken" if not next_token else "NextContinuationToken 未推进"
                 logger.warning(
                     f"桶 {bucket_name} list_objects_v2 第 {page_count} 页返回 "
-                    f"IsTruncated=true 但缺少 NextContinuationToken，已列出 "
-                    f"{len(objects_by_key)} 个对象，回退到 list_objects v1 继续列举"
+                    f"IsTruncated=true 但 {reason}，已列出 {len(objects_by_key)} 个对象，"
+                    f"回退到 list_objects v1 继续列举"
                 )
-                # 使用最后一个key作为v1 marker从断点继续
                 last_key = contents[-1]['Key'] if contents else None
                 v1_objects = self._list_objects_v1(bucket_name, start_marker=last_key)
                 for obj in v1_objects:
