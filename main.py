@@ -113,7 +113,8 @@ class S3Migrator:
         is_source_r2: bool = False,
         direct_read: bool = False,
         max_direct_size: int = 500 * 1024 * 1024,  # 默认500MB，超过此大小的文件使用分块上传
-        skip_existing: bool = True  # 默认跳过已存在的文件
+        skip_existing: bool = True,  # 默认跳过已存在的文件
+        keys_file: Optional[str] = None  # 如指定，则只迁移该文件中列出的key
     ):
         """
         初始化S3迁移器
@@ -148,6 +149,7 @@ class S3Migrator:
         self.direct_read = direct_read
         self.max_direct_size = max_direct_size
         self.skip_existing = skip_existing
+        self.keys_file = keys_file
         self.source_tagging_supported = True
         self.target_tagging_supported = True
         
@@ -233,7 +235,10 @@ class S3Migrator:
         """
         logger.info(f"开始迁移桶: {bucket_name}")
 
-        objects_list = self._list_all_objects(bucket_name)
+        if self.keys_file:
+            objects_list = self._build_objects_from_keys_file(bucket_name, self.keys_file)
+        else:
+            objects_list = self._list_all_objects(bucket_name)
         total_objects = len(objects_list)
         logger.info(f"在桶 {bucket_name} 中找到 {total_objects} 个对象")
 
@@ -321,6 +326,49 @@ class S3Migrator:
                 # 其他错误
                 raise
     
+    def _build_objects_from_keys_file(self, bucket_name: str, keys_file: str) -> List[Dict]:
+        """
+        从 keys 文件读取 key 列表，对源桶执行 head_object 获取大小信息，
+        返回与 _list_all_objects 格式兼容的对象列表。
+        用于按清单补传（例如 verify_sync.py 生成的 missing_<bucket>.txt）。
+        """
+        if not os.path.exists(keys_file):
+            logger.error(f"keys 文件不存在: {keys_file}")
+            return []
+
+        with open(keys_file, 'r', encoding='utf-8') as f:
+            keys = [line.strip() for line in f if line.strip()]
+
+        logger.info(f"从 {keys_file} 读取到 {len(keys)} 个 key，开始获取源端元数据...")
+
+        objects: List[Dict] = []
+        missing_on_source = 0
+        for i, key in enumerate(keys, 1):
+            try:
+                head = retry_operation(
+                    self.source_client.head_object,
+                    Bucket=bucket_name,
+                    Key=key
+                )
+                objects.append({'Key': key, 'Size': head.get('ContentLength', 0)})
+            except ClientError as e:
+                code = e.response.get('Error', {}).get('Code')
+                if code in ('NoSuchKey', '404'):
+                    missing_on_source += 1
+                    logger.warning(f"源端不存在 key: {key}，跳过")
+                else:
+                    logger.error(f"head_object 失败 {key}: {code} - {e}")
+            except Exception as e:
+                logger.error(f"head_object 失败 {key}: {e}")
+
+            if i % 100 == 0 or i == len(keys):
+                logger.info(f"元数据进度 {i}/{len(keys)}")
+
+        if missing_on_source:
+            logger.warning(f"源端共 {missing_on_source} 个 key 不存在（可能已被删除），跳过补传")
+
+        return objects
+
     def _list_all_objects(self, bucket_name: str) -> List[Dict]:
         """
         列出桶中的所有对象 (显式分页，带v1回退与去重)
@@ -860,6 +908,7 @@ def parse_arguments():
     parser.add_argument('--direct-read', action='store_true', help='是否直接读取所有文件，不使用分块处理')
     parser.add_argument('--max-direct-size', type=int, default=500*1024*1024, help='直接读取的最大文件大小，超过此大小的文件使用分块上传 (默认: 500MB)')
     parser.add_argument('--no-skip-existing', action='store_true', help='是否不跳过目标存储中已存在的文件，强制重新上传')
+    parser.add_argument('--keys-file', help='按清单迁移：每行一个key，只迁移文件中列出的对象 (例如 verify_sync 生成的 missing_<bucket>.txt)')
     
     # S3目标配置
     parser.add_argument('--target-endpoint', help='目标S3端点URL')
@@ -950,7 +999,8 @@ def main():
         is_source_r2=is_source_r2,
         direct_read=direct_read,
         max_direct_size=max_direct_size,
-        skip_existing=skip_existing
+        skip_existing=skip_existing,
+        keys_file=args.keys_file
     )
     
     # 执行迁移
