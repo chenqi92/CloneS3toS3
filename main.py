@@ -185,21 +185,16 @@ class S3Migrator:
             try:
                 # 确保目标桶存在
                 self._ensure_bucket_exists(bucket_name)
-                
-                # 迁移单个桶
-                objects, bytes_copied = self.migrate_bucket(bucket_name)
+
+                # 迁移单个桶 (现在返回成功/失败/总数)
+                objects, bytes_copied, failed, bucket_total = self.migrate_bucket(bucket_name)
                 total_objects += objects
                 total_bytes += bytes_copied
-                
-                # 计算该桶的失败对象数量
-                objects_list = self._list_all_objects(bucket_name)
-                bucket_total = len(objects_list)
-                failed = bucket_total - objects
                 total_failed += failed
-                
+
                 if failed > 0:
                     failures_by_bucket[bucket_name] = failed
-                
+
                 logger.info(f"桶 {bucket_name} 迁移完成，成功: {objects}/{bucket_total}，失败: {failed}")
             except Exception as e:
                 logger.error(f"迁移桶 {bucket_name} 时出错: {str(e)}")
@@ -226,24 +221,24 @@ class S3Migrator:
         
         return total_objects, total_bytes, total_failed
     
-    def migrate_bucket(self, bucket_name: str) -> Tuple[int, int]:
+    def migrate_bucket(self, bucket_name: str) -> Tuple[int, int, int, int]:
         """
         迁移单个桶的所有内容
-        
+
         Args:
             bucket_name: 桶名称
-            
+
         Returns:
-            迁移的对象数量和总字节数的元组
+            (成功数, 总字节数, 失败数, 总对象数)
         """
         logger.info(f"开始迁移桶: {bucket_name}")
-        
+
         objects_list = self._list_all_objects(bucket_name)
         total_objects = len(objects_list)
         logger.info(f"在桶 {bucket_name} 中找到 {total_objects} 个对象")
-        
+
         if total_objects == 0:
-            return 0, 0
+            return 0, 0, 0, 0
         
         copied_objects = 0
         failed_objects = 0
@@ -278,7 +273,14 @@ class S3Migrator:
                     failed_objects += 1
                     failed_keys.append(obj['Key'])
                     logger.error(f"复制对象 {obj['Key']} 时出错: {str(e)}")
-        
+
+        # 如果线程池由于任何原因漏掉了部分对象（理论上不会），也要计入失败数
+        processed_total = copied_objects + failed_objects
+        if processed_total < total_objects:
+            missed = total_objects - processed_total
+            logger.error(f"桶 {bucket_name} 有 {missed} 个对象未被线程池处理，计为失败")
+            failed_objects += missed
+
         # 记录迁移结果
         logger.info(f"桶 {bucket_name} 迁移完成: 成功 {copied_objects}/{total_objects} 个对象, "
                   f"失败 {failed_objects} 个对象, 总大小: {self._format_size(total_bytes)}")
@@ -300,8 +302,8 @@ class S3Migrator:
                     logger.info(f"已将失败的对象列表写入文件: {failed_log_file}")
                 except Exception as e:
                     logger.error(f"写入失败对象列表时出错: {str(e)}")
-        
-        return copied_objects, total_bytes
+
+        return copied_objects, total_bytes, failed_objects, total_objects
     
     def _ensure_bucket_exists(self, bucket_name: str):
         """确保目标桶存在，如不存在则创建"""
@@ -321,22 +323,109 @@ class S3Migrator:
     
     def _list_all_objects(self, bucket_name: str) -> List[Dict]:
         """
-        列出桶中的所有对象
-        
-        Args:
-            bucket_name: 桶名称
-            
+        列出桶中的所有对象 (显式分页，带v1回退与去重)
+
+        一些S3兼容服务 (rustfs/MinIO等) 在 list_objects_v2 的 ContinuationToken
+        处理上存在兼容性问题，boto3 paginator 可能在服务端提前结束分页时静默停止，
+        导致列出对象数量远少于实际数量。这里改为显式分页 + 异常校验 + 必要时回退到 v1。
+
         Returns:
-            对象字典列表
+            去重后的对象字典列表
         """
-        objects = []
-        paginator = self.source_client.get_paginator('list_objects_v2')
-        
-        for page in paginator.paginate(Bucket=bucket_name):
-            if 'Contents' in page:
-                objects.extend(page['Contents'])
-        
-        return objects
+        objects_by_key: Dict[str, Dict] = {}
+        continuation_token: Optional[str] = None
+        page_count = 0
+        raw_count = 0
+        page_size = 1000
+
+        while True:
+            kwargs = {'Bucket': bucket_name, 'MaxKeys': page_size}
+            if continuation_token:
+                kwargs['ContinuationToken'] = continuation_token
+
+            response = retry_operation(
+                self.source_client.list_objects_v2,
+                **kwargs
+            )
+
+            page_count += 1
+            contents = response.get('Contents', []) or []
+            raw_count += len(contents)
+
+            for obj in contents:
+                objects_by_key[obj['Key']] = obj
+
+            is_truncated = response.get('IsTruncated', False)
+            if not is_truncated:
+                break
+
+            next_token = response.get('NextContinuationToken')
+            if not next_token:
+                logger.warning(
+                    f"桶 {bucket_name} list_objects_v2 第 {page_count} 页返回 "
+                    f"IsTruncated=true 但缺少 NextContinuationToken，已列出 "
+                    f"{len(objects_by_key)} 个对象，回退到 list_objects v1 继续列举"
+                )
+                # 使用最后一个key作为v1 marker从断点继续
+                last_key = contents[-1]['Key'] if contents else None
+                v1_objects = self._list_objects_v1(bucket_name, start_marker=last_key)
+                for obj in v1_objects:
+                    objects_by_key[obj['Key']] = obj
+                break
+
+            continuation_token = next_token
+
+        unique_count = len(objects_by_key)
+        if unique_count != raw_count:
+            logger.info(
+                f"桶 {bucket_name} 原始列出 {raw_count} 条记录，去重后 {unique_count} 个对象 "
+                f"(分页重复条目: {raw_count - unique_count})"
+            )
+        logger.info(f"桶 {bucket_name} 共列出 {unique_count} 个对象 (使用 {page_count} 页 v2 分页)")
+
+        return list(objects_by_key.values())
+
+    def _list_objects_v1(self, bucket_name: str, start_marker: Optional[str] = None) -> List[Dict]:
+        """
+        使用 list_objects v1 (marker 分页) 列出对象，作为 v2 分页失败的回退方案。
+        """
+        objects_by_key: Dict[str, Dict] = {}
+        marker = start_marker
+        page_count = 0
+
+        while True:
+            kwargs = {'Bucket': bucket_name, 'MaxKeys': 1000}
+            if marker:
+                kwargs['Marker'] = marker
+
+            response = retry_operation(
+                self.source_client.list_objects,
+                **kwargs
+            )
+
+            page_count += 1
+            contents = response.get('Contents', []) or []
+            for obj in contents:
+                objects_by_key[obj['Key']] = obj
+
+            if not response.get('IsTruncated', False):
+                break
+
+            # v1: 优先使用 NextMarker；若无则使用最后一个 Key
+            next_marker = response.get('NextMarker')
+            if not next_marker and contents:
+                next_marker = contents[-1]['Key']
+            if not next_marker:
+                logger.error(f"桶 {bucket_name} v1 分页无法确定下一个 marker，提前终止")
+                break
+            if marker == next_marker:
+                logger.error(f"桶 {bucket_name} v1 分页 marker 未推进 ({marker})，提前终止避免死循环")
+                break
+
+            marker = next_marker
+
+        logger.info(f"桶 {bucket_name} v1 分页共列出 {len(objects_by_key)} 个对象 ({page_count} 页)")
+        return list(objects_by_key.values())
 
     @staticmethod
     def _build_upload_extra_args(object_info: Dict) -> Dict:
