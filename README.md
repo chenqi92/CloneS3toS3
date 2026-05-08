@@ -351,6 +351,36 @@ cp config.template.ini config.ini
 # 然后编辑config.ini文件填入您的配置
 ```
 
+### 5. 删除源端对象
+
+当源端空间占满、UI 无法登录时，可以使用 `delete_source_objects.py` 通过 S3 API 删除一部分对象。
+
+脚本默认是 dry-run，不会真的删除；只有加上 `--execute` 才会执行删除。
+
+先预览某个前缀下的候选对象：
+
+```bash
+python delete_source_objects.py --config config.ini --bucket algorithm --prefix tmp/
+```
+
+预览 30 天前最旧的 500 个对象：
+
+```bash
+python delete_source_objects.py --config config.ini --bucket algorithm --older-than-days 30 --max-objects 500
+```
+
+确认无误后再真正删除：
+
+```bash
+python delete_source_objects.py --config config.ini --bucket algorithm --prefix tmp/ --execute
+```
+
+如果需要跳过交互确认：
+
+```bash
+python delete_source_objects.py --config config.ini --bucket algorithm --prefix tmp/ --execute --yes
+```
+
 ## 常见问题
 
 ### 1. Windows下的编码问题
